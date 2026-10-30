@@ -9,7 +9,7 @@ all:
     windows:
       hosts:
         winhost1:
-          ansible_host: 192.168.56.11          # change to your VM's IP
+          ansible_host: nnn.nnn.nnn.nnn          
 
       vars:
         # ---------------------------------------------------------------------
@@ -22,12 +22,7 @@ all:
         ansible_winrm_transport: ntlm
         ansible_winrm_server_cert_validation: ignore   # lab: self-signed WinRM cert
 
-        # ---------------------------------------------------------------------
-        # Secrets API. The password is stored in Vault's KV v2 engine at
-        #   <secrets_api_url>/v1/<secrets_mount>/data/<secrets_path>
-        # The Vault token is read from the VAULT_TOKEN environment variable,
-        # so it is never written to disk or committed.
-        # ---------------------------------------------------------------------
+  
         secrets_api_url: http://127.0.0.1:8200
         secrets_mount: secret
         secrets_path: windows/testuser

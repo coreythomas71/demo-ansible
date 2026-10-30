@@ -1,5 +1,5 @@
 ---
-# Install with: ansible-galaxy collection install -r requirements.yml
+
 collections:
   - name: ansible.windows      # Windows features, files, ACLs, HTTP checks
     version: ">=2.5.0"
