@@ -1,0 +1,43 @@
+---
+# =============================================================================
+# INVENTORY: the Windows host, how to connect to it, and where the
+# password lives. There's no password in this file. The playbook fetches
+# it from the secrets API (HashiCorp Vault) every time it runs.
+# =============================================================================
+all:
+  children:
+    windows:
+      hosts:
+        winhost1:
+          ansible_host: 192.168.56.11          # change to your VM's IP
+
+      vars:
+        # ---------------------------------------------------------------------
+        # Connection: WinRM over HTTPS as testuser
+        # ---------------------------------------------------------------------
+        ansible_user: testuser
+        ansible_connection: winrm
+        ansible_port: 5986
+        ansible_winrm_scheme: https
+        ansible_winrm_transport: ntlm
+        ansible_winrm_server_cert_validation: ignore   # lab: self-signed WinRM cert
+
+        # ---------------------------------------------------------------------
+        # Secrets API. The password is stored in Vault's KV v2 engine at
+        #   <secrets_api_url>/v1/<secrets_mount>/data/<secrets_path>
+        # The Vault token is read from the VAULT_TOKEN environment variable,
+        # so it is never written to disk or committed.
+        # ---------------------------------------------------------------------
+        secrets_api_url: http://127.0.0.1:8200
+        secrets_mount: secret
+        secrets_path: windows/testuser
+        secrets_validate_certs: false                  # lab: Vault dev server is plain HTTP
+
+        # ---------------------------------------------------------------------
+        # The web applications. Both plays read this one list.
+        # ---------------------------------------------------------------------
+        iis_site: Default Web Site
+        webapps_root: 'C:\inetpub\webapps'
+        webapps:
+          - webapp1
+          - webapp2

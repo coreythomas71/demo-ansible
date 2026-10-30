@@ -1,0 +1,7 @@
+---
+# Install with: ansible-galaxy collection install -r requirements.yml
+collections:
+  - name: ansible.windows      # Windows features, files, ACLs, HTTP checks
+    version: ">=2.5.0"
+  - name: microsoft.iis        # IIS app pools and web applications
+    version: ">=1.0.0"

@@ -1,0 +1,223 @@
+---
+# =============================================================================
+# IIS web applications on winhost1
+# =============================================================================
+#   PLAY 1  Build    install IIS, create webapp1 and webapp2, each with its
+#                    own app pool, folder and page, then test both
+#   PLAY 2  Restart  recycle the webapps' app pools, then test them again
+#
+# Ansible connects as "testuser". The password is never stored in this repo:
+# at the start of every run it's fetched from a secrets API (HashiCorp Vault)
+# and kept only in memory for that run.
+#
+#   export VAULT_TOKEN=<token>                         # who may read the secret
+#   ansible-playbook site.yml                          # build, then restart
+#   ansible-playbook site.yml --tags build             # build only
+#   ansible-playbook site.yml --tags restart           # restart only
+#   ansible-playbook site.yml --tags restart -e '{"restart_webapps": ["webapp2"]}'
+# =============================================================================
+
+# =============================================================================
+# PLAY 1: Build IIS and deploy webapp1 and webapp2
+# =============================================================================
+- name: "PLAY 1 | Build IIS and deploy the web applications"
+  hosts: winhost1
+  gather_facts: false       # facts would need a connection, and we don't have the password yet
+  tags: [build]
+
+  # ---------------------------------------------------------------------------
+  # pre_tasks run before tasks. Tagged "always", so they also run with
+  # --tags restart, which means PLAY 2 always has a password, even on its own.
+  # ---------------------------------------------------------------------------
+  pre_tasks:
+    - name: "CREDENTIALS | Make sure a Vault token is available"
+      ansible.builtin.assert:
+        that: lookup('ansible.builtin.env', 'VAULT_TOKEN') | length > 0
+        fail_msg: "Set VAULT_TOKEN first, e.g.  export VAULT_TOKEN=<token>"
+        quiet: true
+      tags: [always]
+
+    # Call the secrets API from the control node (delegate_to: localhost),
+    # because we can't reach winhost1 until we have the password.
+    #   * no_log: the response contains the password, so it's never printed,
+    #     even with -vvv or when the task fails
+    #   * check_mode: false: reading a secret is safe, so it also runs in --check
+    #   * retries: only on Vault being unavailable or erroring (5xx or no
+    #     connection). A 403 (bad token) fails immediately.
+    - name: "CREDENTIALS | Get testuser's password from the secrets API"
+      ansible.builtin.uri:
+        url: "{{ secrets_api_url }}/v1/{{ secrets_mount }}/data/{{ secrets_path }}"
+        method: GET
+        headers:
+          X-Vault-Token: "{{ lookup('ansible.builtin.env', 'VAULT_TOKEN') }}"
+        validate_certs: "{{ secrets_validate_certs | bool }}"
+        return_content: true
+        status_code: 200
+      register: secret_response
+      delegate_to: localhost
+      check_mode: false
+      no_log: true
+      until: secret_response.status | default(-1) not in [-1, 500, 502, 503]
+      retries: 3
+      delay: 5
+      tags: [always]
+
+    # Setting ansible_password as a fact makes every later task (in both
+    # plays) log in with it. Vault KV v2 nests the secret under data.data.
+    - name: "CREDENTIALS | Use the password for this run"
+      ansible.builtin.set_fact:
+        ansible_password: "{{ secret_response.json.data.data.password }}"
+      no_log: true
+      tags: [always]
+
+    # First real connection: proves the password from the API works
+    - name: "CREDENTIALS | Log in to winhost1 as testuser"
+      ansible.windows.win_ping:
+      tags: [always]
+
+  tasks:
+    # =========================================================================
+    # STEP 1: Install IIS
+    # Web-Scripting-Tools provides the PowerShell modules that the
+    # microsoft.iis collection needs.
+    # =========================================================================
+    - name: "STEP 1 | Install IIS"
+      ansible.windows.win_feature:
+        name:
+          - Web-Server
+          - Web-Asp-Net45
+          - Web-Scripting-Tools
+          - Web-Mgmt-Console
+        state: present
+      register: iis_install
+
+    - name: "STEP 1 | Reboot if Windows requires it"
+      ansible.windows.win_reboot:
+        reboot_timeout: 900
+      when: iis_install.reboot_required
+
+    # The Default Web Site (port 80) hosts both applications:
+    #   http://winhost1/webapp1   http://winhost1/webapp2
+    - name: "STEP 1 | Make sure the parent site is running"
+      microsoft.iis.website:
+        name: "{{ iis_site }}"
+        state: started
+
+    # =========================================================================
+    # STEP 2: Create each web application. The loops run once per name in
+    # the "webapps" list (inventory.yml), so adding webapp3 is a one-line
+    # change. Each app gets its OWN app pool, so restarting or crashing one
+    # never affects the other.
+    # =========================================================================
+    - name: "STEP 2 | Create a folder for each webapp"
+      ansible.windows.win_file:
+        path: "{{ webapps_root }}\\{{ item }}"
+        state: directory
+      loop: "{{ webapps }}"
+
+    - name: "STEP 2 | Create an application pool for each webapp"
+      microsoft.iis.web_app_pool:
+        name: "{{ item }}"
+        state: started
+        attributes:
+          managedRuntimeVersion: v4.0
+          startMode: AlwaysRunning                      # warm after reboot or recycle
+          processModel.identityType: ApplicationPoolIdentity
+      loop: "{{ webapps }}"
+
+    # Least privilege: each pool's built-in account ("IIS AppPool\webapp1")
+    # can read its own folder and nothing else
+    - name: "STEP 2 | Give each app pool read access to its own folder"
+      ansible.windows.win_acl:
+        path: "{{ webapps_root }}\\{{ item }}"
+        user: "IIS AppPool\\{{ item }}"
+        rights: ReadAndExecute
+        type: allow
+        state: present
+        inherit: ContainerInherit, ObjectInherit
+        propagation: None
+      loop: "{{ webapps }}"
+
+    - name: "STEP 2 | Deploy a home page for each webapp"
+      ansible.windows.win_copy:
+        dest: "{{ webapps_root }}\\{{ item }}\\index.html"
+        content: |
+          <!DOCTYPE html>
+          <html><head><title>{{ item }}</title></head>
+          <body style="font-family: Segoe UI, sans-serif; margin: 3rem;">
+            <h1>{{ item }}</h1>
+            <p>Running on {{ inventory_hostname }} in app pool {{ item }}. Deployed by Ansible.</p>
+          </body></html>
+      loop: "{{ webapps }}"
+
+    # Ties it together: URL path -> folder -> app pool
+    - name: "STEP 2 | Create the IIS web applications"
+      microsoft.iis.web_application:
+        name: "{{ item }}"
+        site: "{{ iis_site }}"
+        physical_path: "{{ webapps_root }}\\{{ item }}"
+        application_pool: "{{ item }}"
+        state: present
+      loop: "{{ webapps }}"
+
+    # =========================================================================
+    # STEP 3: Test each webapp from winhost1 itself
+    # =========================================================================
+    - name: "STEP 3 | Check each webapp answers with its own page"
+      ansible.windows.win_uri:
+        url: "http://localhost/{{ item }}/"
+        return_content: true
+        status_code: 200
+      register: build_check
+      loop: "{{ webapps }}"
+      until: build_check.status_code | default(0) == 200 and item in build_check.content
+      retries: 5
+      delay: 3
+      when: not ansible_check_mode
+
+# =============================================================================
+# PLAY 2: Restart the web applications
+# =============================================================================
+- name: "PLAY 2 | Restart the web applications"
+  hosts: winhost1
+  gather_facts: false
+  tags: [restart]
+
+  vars:
+    # Restart all webapps by default, or pick some with -e
+    restart_webapps: "{{ webapps }}"
+
+  tasks:
+    - name: "RESTART | Only restart webapps that exist in the inventory"
+      ansible.builtin.assert:
+        that: restart_webapps | difference(webapps) | length == 0
+        fail_msg: "Unknown webapp(s): {{ restart_webapps | difference(webapps) | join(', ') }}. Known: {{ webapps | join(', ') }}"
+        quiet: true
+
+    # "Restarting" a webapp means recycling its app pool. IIS starts a new
+    # worker process and lets the old one finish its current requests, so
+    # users don't see errors. (This is why each app has its own pool: only
+    # the chosen app restarts.)
+    - name: "RESTART | Recycle each webapp's application pool"
+      microsoft.iis.web_app_pool:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ restart_webapps }}"
+
+    - name: "RESTART | Check each webapp is back"
+      ansible.windows.win_uri:
+        url: "http://localhost/{{ item }}/"
+        return_content: true
+        status_code: 200
+      register: restart_check
+      loop: "{{ restart_webapps }}"
+      until: restart_check.status_code | default(0) == 200 and item in restart_check.content
+      retries: 10
+      delay: 3
+
+    - name: "RESTART | Summary"
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: restarted and responding (HTTP {{ item.status_code }})"
+      loop: "{{ restart_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
